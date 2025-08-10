@@ -637,6 +637,266 @@ class GNSSAnalyzer:
         self.results['code_phase_differences'] = differences
         return differences
 
+    def remove_code_phase_outliers(self, data: Dict, threshold: float = 5.0) -> str:
+        """
+        基于伪距相位差值变化阈值，剔除异常观测值并生成剔除后的文件
+        
+        参数:
+            data: RINEX观测数据
+            threshold: 差值变化阈值（米），默认5米
+            
+        返回:
+            剔除后的文件路径
+        """
+        self.start_stage(6, "基于伪距相位差值剔除异常观测值", 100)
+        
+        # 确保已经计算了伪距相位差值
+        if not self.results.get('code_phase_differences'):
+            self.calculate_code_phase_differences(data)
+        
+        # 初始化日志内容
+        log_content = [
+            "=" * 70 + "\n",
+            "基于伪距相位差值变化的异常观测值剔除日志\n",
+            "=" * 70 + "\n\n",
+            f"差值变化阈值: {threshold} 米\n\n"
+        ]
+        
+        # 1. 识别需要剔除的历元
+        outlier_epochs = defaultdict(lambda: defaultdict(list))  # {sat_id: {freq: [历元索引]}}
+        outlier_details = defaultdict(list)  # {sat_id: [异常详情]}
+        
+        code_phase_diffs = self.results['code_phase_differences']
+        total_sats = len(code_phase_diffs)
+        processed_sats = 0
+        
+        for sat_id, freq_data in code_phase_diffs.items():
+            sat_outliers = {}
+            
+            for freq, diff_data in freq_data.items():
+                times = diff_data['times']
+                diff_changes = diff_data['diff_changes']
+                
+                # 找出超过阈值的差值变化对应的历元
+                outlier_indices = []
+                for i, change in enumerate(diff_changes):
+                    if change is not None and change > threshold:
+                        # 注意：diff_changes[i] 对应的是 times[i+1] 历元（后一个历元）
+                        # 因为 diff_changes 计算的是后一个值减前一个值
+                        outlier_epoch_idx = i + 1  # 后一个历元
+                        if outlier_epoch_idx < len(times):
+                            outlier_indices.append(outlier_epoch_idx)
+                            
+                            # 记录异常详情
+                            outlier_info = {
+                                'freq': freq,
+                                'epoch_idx': outlier_epoch_idx,
+                                'time': times[outlier_epoch_idx],
+                                'diff_change': change,
+                                'threshold': threshold
+                            }
+                            outlier_details[sat_id].append(outlier_info)
+                
+                if outlier_indices:
+                    sat_outliers[freq] = outlier_indices
+                    outlier_epochs[sat_id][freq] = outlier_indices
+            
+            processed_sats += 1
+            self.update_progress(int(processed_sats / total_sats * 50))
+        
+        # 2. 读取RINEX文件内容
+        with open(self.input_file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # 3. 解析观测类型映射
+        system_obs_info = {}  # {系统: {'obs_types': [], 'freq_to_indices': {频率: {观测类型: 字段索引}}}}
+        for line in lines:
+            if 'SYS / # / OBS TYPES' in line:
+                system = line[0]
+                obs_types = line.split()[2:]
+                freq_to_indices = defaultdict(dict)  # {频率: {'code': 索引, 'phase': 索引, 'doppler': 索引}}
+                
+                for idx, obs in enumerate(obs_types):
+                    if obs.startswith('C'):  # 伪距
+                        freq = f"L{obs[1:]}"
+                        freq_to_indices[freq]['code'] = idx
+                    elif obs.startswith('L'):  # 相位
+                        freq = f"L{obs[1:]}"
+                        freq_to_indices[freq]['phase'] = idx
+                    elif obs.startswith('D'):  # 多普勒
+                        freq = f"L{obs[1:]}"
+                        freq_to_indices[freq]['doppler'] = idx
+                
+                system_obs_info[system] = {
+                    'obs_types': obs_types,
+                    'freq_to_indices': freq_to_indices
+                }
+        
+        # 4. 修改异常历元的观测值
+        modified_count = defaultdict(int)  # {观测类型: 修改数量}
+        modified_satellites = set()
+        satellite_modify_details = []
+        
+        for sat_id, freq_outliers in outlier_epochs.items():
+            sat_system = sat_id[0]
+            sat_prn = sat_id[1:].zfill(2)
+            system_info = system_obs_info.get(sat_system, {})
+            freq_indices = system_info.get('freq_to_indices', {})
+            
+            if not freq_indices:
+                continue
+            
+            satellite_modifications = []
+            
+            # 处理每个频率的异常历元
+            for freq, epoch_indices in freq_outliers.items():
+                for epoch_idx in epoch_indices:
+                    # 定位历元行
+                    epoch_start = -1
+                    for i, line in enumerate(lines):
+                        if line.startswith('>'):
+                            # 解析历元时间
+                            parts = line[1:].split()
+                            if len(parts) >= 6:
+                                try:
+                                    year = int(parts[0])
+                                    month = int(parts[1])
+                                    day = int(parts[2])
+                                    hour = int(parts[3])
+                                    minute = int(parts[4])
+                                    second = int(float(parts[5]))
+                                    epoch_time = pd.Timestamp(
+                                        year=year, month=month, day=day,
+                                        hour=hour, minute=minute, second=second
+                                    )
+                                    
+                                    # 从code_phase_diffs中获取对应的时间
+                                    if sat_id in code_phase_diffs and freq in code_phase_diffs[sat_id]:
+                                        diff_times = code_phase_diffs[sat_id][freq]['times']
+                                        if epoch_idx < len(diff_times) and epoch_time == diff_times[epoch_idx]:
+                                            epoch_start = i
+                                            break
+                                except (ValueError, IndexError):
+                                    continue
+                    
+                    if epoch_start < 0:
+                        continue
+                    
+                    # 定位该卫星在历元中的数据行
+                    sat_line_idx = -1
+                    j = epoch_start + 1
+                    while j < len(lines) and not lines[j].startswith('>'):
+                        line = lines[j]
+                        if len(line) >= 3 and line[0] == sat_system and line[1:3].strip().zfill(2) == sat_prn:
+                            sat_line_idx = j
+                            break
+                        j += 1
+                    
+                    if sat_line_idx < 0:
+                        continue
+                    
+                    # 修改异常观测值字段
+                    original_line = lines[sat_line_idx]
+                    modified_line = list(original_line)
+                    field_modified = False
+                    modified_fields = []
+                    
+                    # 剔除伪距、相位、多普勒观测值
+                    for obs_type in ['code', 'phase', 'doppler']:
+                        if freq in freq_indices and obs_type in freq_indices[freq]:
+                            field_idx = freq_indices[freq][obs_type]
+                            start_pos = 3 + field_idx * 16  # 3: 卫星标识长度
+                            end_pos = start_pos + 16
+                            
+                            if end_pos <= len(modified_line):
+                                original_field = original_line[start_pos:end_pos].strip()
+                                if original_field:
+                                    modified_line[start_pos:end_pos] = ' ' * 16
+                                    modified_count[obs_type] += 1
+                                    field_modified = True
+                                    modified_fields.append(f"{freq}({obs_type})")
+                    
+                    if field_modified:
+                        lines[sat_line_idx] = ''.join(modified_line)
+                        modified_satellites.add(sat_id)
+                        satellite_modifications.append(
+                            f"  历元 {epoch_idx} ({epoch_time}): 已剔除 {', '.join(modified_fields)}")
+            
+            if satellite_modifications:
+                satellite_modify_details.append(f"卫星 {sat_id} 的剔除详情:")
+                satellite_modify_details.extend(satellite_modifications)
+                satellite_modifications.append("")
+        
+        # 5. 保存修改后的文件
+        results_dir = self.current_result_dir
+        file_name = os.path.basename(self.input_file_path)
+        cleaned_file_name = f"cleaned1-{file_name}"
+        output_path = os.path.join(results_dir, cleaned_file_name)
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+        
+        # 6. 生成详细日志
+        total_modified = sum(modified_count.values())
+        log_content.append("\n一、剔除统计摘要\n")
+        log_content.append("-" * 70 + "\n")
+        log_content.append(f"总计剔除卫星数: {len(modified_satellites)}\n")
+        log_content.append(f"总计剔除观测值: {total_modified}\n")
+        log_content.append(
+            f"剔除分类: 伪距={modified_count['code']}, 相位={modified_count['phase']}, 多普勒={modified_count['doppler']}\n\n")
+        
+        # 添加异常历元详情到日志
+        log_content.append("\n二、异常历元检测详情\n")
+        log_content.append("-" * 70 + "\n")
+        
+        # 按系统组织卫星信息
+        system_satellites = defaultdict(list)
+        for sat_id in outlier_details.keys():
+            system_satellites[sat_id[0]].append(sat_id)
+        
+        # 按系统顺序输出
+        for system, satellites in system_satellites.items():
+            log_content.append(f"卫星系统 {system}:\n")
+            
+            for sat_id in sorted(satellites):
+                details = outlier_details[sat_id]
+                log_content.append(f"  卫星 {sat_id} ({len(details)}个异常观测值):\n")
+                
+                # 按频率分组异常信息
+                freq_groups = defaultdict(list)
+                for detail in details:
+                    freq_groups[detail['freq']].append(detail)
+                
+                for freq in sorted(freq_groups.keys()):
+                    freq_details = freq_groups[freq]
+                    log_content.append(f"    频率 {freq}:\n")
+                    
+                    for detail in freq_details:
+                        log_content.append(f"      - 历元 {detail['epoch_idx']} ({detail['time']}): "
+                                           f"差值变化={detail['diff_change']:.6f}m, "
+                                           f"阈值={detail['threshold']:.6f}m\n")
+                log_content.append("\n")
+        
+        # 写入日志文件
+        debug_file_name = "code_phase_cleaning.log"
+        debug_path = os.path.join(results_dir, debug_file_name)
+        with open(debug_path, 'w', encoding='utf-8') as f:
+            f.writelines(log_content)
+        
+        # 控制台输出
+        print(f"--基于伪距相位差值变化检测到 {len(outlier_epochs)} 颗卫星存在异常历元")
+        print(f"--总计剔除 {total_modified} 个观测值，涉及 {len(modified_satellites)} 颗卫星")
+        print(f"   - 伪距: {modified_count['code']}")
+        print(f"   - 相位: {modified_count['phase']}")
+        print(f"   - 多普勒: {modified_count['doppler']}")
+        print(f"--剔除异常观测值后的文件保存至: {output_path}")
+        print(f"--剔除详细信息保存至: {debug_path}")
+        
+        # 更新进度
+        self.update_progress(100)
+        
+        return output_path
+
     def calculate_phase_prediction_errors(self, data: Dict) -> Dict:
         """计算相位预测误差"""
         self.start_stage(4, "计算相位预测误差", 100)
@@ -837,8 +1097,21 @@ class GNSSAnalyzer:
                         )
                     satellite_freq_thresholds[sat_id][freq][obs_type] = threshold
 
-        # 2. 读取RINEX文件内容
-        with open(self.input_file_path, 'r', encoding='utf-8') as f:
+        # 2. 读取RINEX文件内容（优先读取基于伪距相位差值剔除后的文件）
+        input_file = self.input_file_path
+        # 检查是否存在基于伪距相位差值剔除后的文件
+        results_dir = self.current_result_dir
+        file_name = os.path.basename(self.input_file_path)
+        cleaned_file_name = f"cleaned1-{file_name}"
+        cleaned_file_path = os.path.join(results_dir, cleaned_file_name)
+        
+        if os.path.exists(cleaned_file_path):
+            input_file = cleaned_file_path
+            log_content.append(f"使用基于伪距相位差值剔除后的文件: {cleaned_file_name}\n")
+        else:
+            log_content.append(f"使用原始文件: {file_name}\n")
+        
+        with open(input_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
         # 3. 解析历元时间戳
@@ -993,7 +1266,7 @@ class GNSSAnalyzer:
         # 7. 保存修改后的文件
         results_dir = self.current_result_dir
         file_name = os.path.basename(self.input_file_path)
-        modified_file_name = f"mod-{file_name}"
+        modified_file_name = f"cleaned2-{file_name}"
         output_path = os.path.join(results_dir, modified_file_name)
 
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -1043,7 +1316,7 @@ class GNSSAnalyzer:
                 log_content.append("\n")
 
         # 写入日志文件
-        debug_file_name = "cleaning_debug.log"
+        debug_file_name = "double_diffs_cleaning.log"
         debug_path = os.path.join(results_dir, debug_file_name)
         with open(debug_path, 'w', encoding='utf-8') as f:
             f.writelines(log_content)
@@ -1947,8 +2220,11 @@ def main():
                 status_var.set(f"正在计算三倍中误差 ({i}/{total_files})...")
                 triple_errors = analyzer.calculate_triple_median_error(double_diffs)  # 计算三倍中误差
 
+                status_var.set(f"正在基于伪距相位差值剔除异常观测值 ({i}/{total_files})...")
+                cleaned_file_path = analyzer.remove_code_phase_outliers(data)  # 基于伪距相位差值剔除异常观测值
+                
                 status_var.set(f"正在剔除异常值并保存文件 ({i}/{total_files})...")
-                analyzer.remove_outliers_and_save(double_diffs, triple_errors)  # 新增：剔除异常值并保存
+                analyzer.remove_outliers_and_save(double_diffs, triple_errors)  # 基于新文件剔除异常值并保存
 
                 # 保存报告和所有图表
                 status_var.set(f"正在保存分析报告 ({i}/{total_files})...")
