@@ -231,7 +231,7 @@ class GNSSPlotter:
 
         legend = ax.legend(handles=legend_items, loc='center right', bbox_to_anchor=(1.0, 0.5), frameon=True, fontsize=plt.rcParams.get('legend.fontsize', 'small'), borderpad=0.4, fancybox=True, framealpha=0.9)
         legend.set_draggable(True)
-        fig.subplots_adjust(left=0.08, right=0.88, top=0.96, bottom=0.08)
+        fig.subplots_adjust(left=0.08, right=0.93, top=0.96, bottom=0.08)
 
         if save:
             path = self._save_fig(fig, 'satellite_count', output_dir)
@@ -359,7 +359,7 @@ class GNSSPlotter:
         )
         legend.set_draggable(True)
 
-        fig.subplots_adjust(left=0.08, right=0.76, top=0.92, bottom=0.08)
+        fig.subplots_adjust(left=0.08, right=0.85, top=0.92, bottom=0.08)
 
         if MPLCURSORS_AVAILABLE and not save:
             cursor = mplcursors.cursor(ax, hover=False)
@@ -838,6 +838,415 @@ class GNSSPlotter:
             return {'figure': None, 'path': path}
         return {'figure': fig, 'path': None}
 
+    def plot_pseudorange_multipath(self, multipath_results: Dict[str, Any], sat_id: str,
+                                   freq_pair: Optional[tuple] = None,
+                                   save: bool = True,
+                                   output_dir: Optional[str] = None) -> Dict[str, Any]:
+        """绘制预计算的单颗卫星伪距多路径结果。"""
+        sat_data = multipath_results.get(sat_id)
+        if not sat_data:
+            raise ValueError(f"No pseudorange multipath data for satellite {sat_id}")
+
+        freq1, freq2 = sat_data.get('freq_pair', ('?', '?'))
+        segments = sat_data.get('segments', {}) or {}
+        stats = sat_data.get('stats', {}) or {}
+        coeffs = sat_data.get('coefficients', {}) or {}
+
+        if freq_pair and len(freq_pair) == 2:
+            freq1, freq2 = freq_pair
+            if freq1 not in segments or freq2 not in segments:
+                raise ValueError(f"No pseudorange multipath data for satellite {sat_id} with pair {freq1}/{freq2}")
+
+        if freq1 not in segments or freq2 not in segments:
+            raise ValueError(f"No pseudorange multipath data for satellite {sat_id}")
+
+        flat_freq1 = [value for segment in segments.get(freq1, []) for value in segment.get('values', [])]
+        flat_freq2 = [value for segment in segments.get(freq2, []) for value in segment.get('values', [])]
+        if not flat_freq1 and not flat_freq2:
+            raise ValueError(f"No valid multipath samples for {sat_id}")
+
+        colors = {freq1: 'tab:blue', freq2: 'tab:orange'}
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        if not hasattr(axes, '__iter__'):
+            axes = [axes]
+
+        for ax, freq_key, title_tag in (
+            (axes[0], freq1, '(a)'),
+            (axes[1], freq2, '(b)'),
+        ):
+            segs = segments.get(freq_key, [])
+            for seg_idx, seg in enumerate(segs):
+                label = freq_key if seg_idx == 0 else None
+                ax.plot(seg.get('times', []), seg.get('values', []), color=colors[freq_key], marker='o', markersize=3,
+                        linewidth=1.0, alpha=0.85, label=label)
+            ax.axhline(0, color='k', linestyle='--', linewidth=0.8, alpha=0.35)
+            ax.set_ylabel('PMP (m)')
+            stat = stats.get(freq_key, {})
+            if 'rms' not in stat:
+                values = flat_freq1 if freq_key == freq1 else flat_freq2
+                stat = {
+                    **stat,
+                    'rms': math.sqrt(sum(v * v for v in values) / len(values)) if values else 0.0,
+                }
+            ax.set_title(
+                f'{title_tag} {freq_key}  mean={stat.get("mean", 0.0):.3f} m  '
+                f'rms={stat.get("rms", 0.0):.3f} m  std={stat.get("std", 0.0):.3f} m',
+                loc='left'
+            )
+            ax.grid(True, alpha=0.3)
+            if segs:
+                ax.legend(loc='upper right')
+
+        axes[1].xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
+        axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        fig.autofmt_xdate(rotation=0, ha='center')
+
+        fig.suptitle(f'Pseudorange Multipath Satellite  {sat_id}  ({freq1} + {freq2})', fontweight='bold')
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if MPLCURSORS_AVAILABLE and not save:
+            cursor = mplcursors.cursor(axes)
+
+            def _on_add(sel):
+                x_val, y_val = sel.target
+                try:
+                    x_text = mdates.num2date(x_val).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    x_text = str(x_val)
+                freq_key = freq1 if sel.artist.axes == axes[0] else freq2
+                sel.annotation.set(
+                    text=f'频率: {freq_key}\n时间: {x_text}\nPMP: {y_val:.4f} m\n\n点击后按←/→键\n(图表窗口需有焦点)',
+                    bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.8)
+                )
+
+            cursor.connect('add', _on_add)
+
+        if save:
+            path = self._save_fig(fig, f'pseudorange_multipath_satellite_{sat_id}_{freq1}_{freq2}', output_dir)
+            return {'figure': None, 'path': path}
+        return {'figure': fig, 'path': None}
+
+    def plot_pseudorange_multipath_overview(self, observations: Dict[str, Any],
+                                            save: bool = True,
+                                            output_dir: Optional[str] = None,
+                                            smoothing_window: int = 5,
+                                            system_filters=None,
+                                            sat_filters=None,
+                                            freq_filters=None) -> Dict[str, Any]:
+        """Plot constellation-level pseudorange multipath overview.
+
+        Each constellation gets one subplot. Within each subplot, satellites are drawn in distinct colors.
+        The selected PMP pair for each satellite follows the requested default/fallback rules.
+        """
+        obs = observations.get('observations_meters', observations) if isinstance(observations, dict) else observations
+        if not obs:
+            raise ValueError('No observations available for pseudorange multipath overview plot')
+
+        from src.processing.calculator import MetricCalculator
+        from src.reporting.reporter import ReportGenerator
+        import numpy as np
+
+        system_name_map = {
+            'G': 'GPS',
+            'C': 'BDS',
+            'E': 'Galileo',
+            'J': 'QZSS',
+            'R': 'GLONASS',
+            'I': 'IRNSS',
+        }
+        system_order = {'G': 0, 'C': 1, 'E': 2, 'J': 3, 'R': 4, 'I': 5}
+
+        mc = MetricCalculator()
+        grouped_results: Dict[str, list] = {}
+        log_lines = []
+        total_satellites = 0
+        total_plotted = 0
+
+        preferred_pairs_by_system = {
+            'G': [('L1C', 'L5Q')],
+            'C': [('L1P', 'L5P'), ('L2I', 'L5P'), ('L2I', 'L1P')],
+            'E': [('L1C', 'L5Q'), ('L1C', 'L7Q'), ('L5Q', 'L7Q')],
+            'J': [('L1C', 'L5Q')],
+        }
+
+        def _has_valid_code(sat_data: Dict[str, Any], freq_name: str) -> bool:
+            d = sat_data.get(freq_name, {})
+            code_vals = d.get('code', []) if isinstance(d, dict) else []
+            return any(v is not None for v in code_vals)
+
+        def _ordered_pairs_for_sat(system: str, sat_data: Dict[str, Any]):
+            from itertools import combinations
+
+            valid_freqs = [f for f in sat_data.keys() if _has_valid_code(sat_data, f)]
+            if len(valid_freqs) < 2:
+                return []
+
+            pair_list = []
+            seen = set()
+            for f1, f2 in preferred_pairs_by_system.get(system, []):
+                if f1 in valid_freqs and f2 in valid_freqs:
+                    key = tuple(sorted((f1, f2)))
+                    if key not in seen:
+                        seen.add(key)
+                        pair_list.append((f1, f2))
+
+            for f1, f2 in combinations(valid_freqs, 2):
+                key = tuple(sorted((f1, f2)))
+                if key not in seen:
+                    seen.add(key)
+                    pair_list.append((f1, f2))
+            return pair_list
+
+        for sat_id in sorted(obs.keys(), key=self._satellite_sort_key):
+            sat_data = obs.get(sat_id) or {}
+            system = sat_id[0] if sat_id else ''
+
+            if not self._selection_allows(system_filters, system):
+                continue
+            if not self._selection_allows(sat_filters, sat_id):
+                continue
+
+            ordered_pairs = _ordered_pairs_for_sat(system, sat_data)
+            if not ordered_pairs:
+                log_lines.append(f'{sat_id}: skipped, no valid frequency pair')
+                continue
+
+            target_freqs = {f for f in sat_data.keys() if _has_valid_code(sat_data, f)}
+            if freq_filters:
+                target_freqs = {f for f in target_freqs if f in set(freq_filters)}
+
+            covered_freqs = set()
+            sat_has_valid = False
+            for pair_idx, pair in enumerate(ordered_pairs):
+                if freq_filters and (pair[0] not in set(freq_filters) or pair[1] not in set(freq_filters)):
+                    continue
+
+                # avoid redundant pair if it doesn't add new frequency coverage
+                if sat_has_valid and not ((set(pair) - covered_freqs) & target_freqs):
+                    continue
+
+                try:
+                    sat_result = mc.calculate_pseudorange_multipath(
+                        {'observations_meters': {sat_id: sat_data}},
+                        freq_pair=pair,
+                        smoothing_window=smoothing_window,
+                    ).get(sat_id)
+                except Exception as exc:
+                    log_lines.append(f'{sat_id}: skipped, calculation failed for {pair[0]}+{pair[1]} ({exc})')
+                    continue
+
+                if not sat_result:
+                    continue
+
+                sat_has_valid = True
+                grouped_results.setdefault(system, []).append({
+                    'sat_id': sat_id,
+                    'pair': pair,
+                    'rule': 'preferred' if pair_idx == 0 else f'fallback_{pair_idx}',
+                    'result': sat_result,
+                })
+                covered_freqs.update(pair)
+                total_plotted += 1
+
+                stats = sat_result.get('stats', {}) or {}
+                s1 = stats.get(pair[0], {})
+                s2 = stats.get(pair[1], {})
+                log_lines.append(
+                    f"{sat_id}: pair={pair[0]}+{pair[1]} | "
+                    f"{pair[0]}: count={s1.get('count', 0)} mean={s1.get('mean', 0.0):.3f} "
+                    f"rms={s1.get('rms', 0.0):.3f} std={s1.get('std', 0.0):.3f} | "
+                    f"{pair[1]}: count={s2.get('count', 0)} mean={s2.get('mean', 0.0):.3f} "
+                    f"rms={s2.get('rms', 0.0):.3f} std={s2.get('std', 0.0):.3f}"
+                )
+
+                if target_freqs and target_freqs.issubset(covered_freqs):
+                    break
+
+            if sat_has_valid:
+                total_satellites += 1
+            else:
+                log_lines.append(f'{sat_id}: skipped, no valid PMP data under current filters')
+
+        if not grouped_results:
+            raise ValueError('No valid pseudorange multipath overview data found')
+
+        system_keys = [system for system in sorted(grouped_results.keys(), key=lambda s: (system_order.get(s, 99), s)) if grouped_results.get(system)]
+        fig_height = max(4.8, 3.8 * len(system_keys))
+        fig, axes = plt.subplots(len(system_keys), 1, figsize=(15, fig_height), sharex=True)
+        if len(system_keys) == 1:
+            axes = [axes]
+
+        line_meta = {}
+        for ax, system in zip(axes, system_keys):
+            sat_items = grouped_results.get(system, [])
+            if not sat_items:
+                continue
+
+            sat_ids = sorted({item['sat_id'] for item in sat_items}, key=self._satellite_sort_key)
+            colors = plt.get_cmap('tab20')(np.linspace(0, 1, max(len(sat_ids), 2), endpoint=False))
+            sat_color_map = {sid: colors[idx % len(colors)] for idx, sid in enumerate(sat_ids)}
+            all_times = []
+            freq_summary = {}
+            sat_legend_handles = []
+            sat_legend_seen = set()
+
+            for idx, item in enumerate(sat_items):
+                sat_id = item['sat_id']
+                pair = item['pair']
+                sat_result = item['result']
+                freq1, freq2 = pair
+                color = sat_color_map.get(sat_id, colors[idx % len(colors)])
+
+                for freq_key, line_style in ((freq1, '-'), (freq2, '--')):
+                    for seg_idx, seg in enumerate((sat_result.get('segments', {}) or {}).get(freq_key, [])):
+                        times = seg.get('times', []) or []
+                        values = seg.get('values', []) or []
+                        if not times or not values:
+                            continue
+                        all_times.extend(times)
+                        line, = ax.plot(
+                            times,
+                            values,
+                            color=color,
+                            linestyle=line_style,
+                            marker='o',
+                            markersize=2.2,
+                            linewidth=1.0,
+                            alpha=0.85,
+                        )
+                        line_meta[line] = {
+                            'sat_id': sat_id,
+                            'freq_key': freq_key,
+                            'pair': pair,
+                        }
+
+                if sat_id not in sat_legend_seen:
+                    sat_legend_seen.add(sat_id)
+                    sat_legend_handles.append(
+                        Line2D(
+                            [0], [0],
+                            color=color,
+                            linestyle='-',
+                            linewidth=2.0,
+                            marker='o',
+                            markersize=5,
+                            label=sat_id,
+                        )
+                    )
+
+                freq_summary.setdefault(freq1, []).extend([
+                    v
+                    for seg in (sat_result.get('segments', {}) or {}).get(freq1, [])
+                    for v in (seg.get('values', []) or [])
+                    if v is not None
+                ])
+                freq_summary.setdefault(freq2, []).extend([
+                    v
+                    for seg in (sat_result.get('segments', {}) or {}).get(freq2, [])
+                    for v in (seg.get('values', []) or [])
+                    if v is not None
+                ])
+
+            ax.axhline(0, color='k', linestyle='--', linewidth=0.8, alpha=0.35)
+            ax.set_ylabel('PMP (m)')
+            ax.set_title(f'{system_name_map.get(system, system or "?")} ({system})', loc='left', fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            if all_times:
+                ax.set_xlim(min(all_times), max(all_times))
+
+            if freq_summary:
+                rms_parts = []
+                if system == 'C':
+                    ordered_keys = [k for k in ('L2I', 'L1P', 'L5P') if k in freq_summary]
+                    ordered_keys += [k for k in sorted(freq_summary.keys()) if k not in ordered_keys]
+                else:
+                    ordered_keys = sorted(freq_summary.keys())
+
+                for freq_key in ordered_keys:
+                    vals = freq_summary.get(freq_key, [])
+                    rms_val = math.sqrt(sum(v * v for v in vals) / len(vals)) if vals else 0.0
+                    rms_parts.append(f'{freq_key}:{rms_val:.2f}')
+                ax.text(
+                    0.01,
+                    0.98,
+                    'RMS ' + '  '.join(rms_parts),
+                    transform=ax.transAxes,
+                    va='top',
+                    ha='left',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.75)
+                )
+
+            if sat_legend_handles:
+                legend = ax.legend(
+                    handles=sat_legend_handles,
+                    loc='upper left',
+                    bbox_to_anchor=(1.01, 1.0),
+                    ncol=1,
+                    frameon=True,
+                )
+                legend.set_draggable(True)
+
+        if MPLCURSORS_AVAILABLE and not save and line_meta:
+            cursor = mplcursors.cursor(list(line_meta.keys()), hover=False)
+
+            def _on_overview_add(sel):
+                artist = sel.artist
+                meta = line_meta.get(artist, {})
+                sat_id = meta.get('sat_id', '?')
+                freq_key = meta.get('freq_key', '?')
+                pair = meta.get('pair', ('?', '?'))
+                x_val, y_val = sel.target
+                try:
+                    t_text = mdates.num2date(x_val).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    t_text = str(x_val)
+                sel.annotation.set(
+                    text=(
+                        f'卫星: {sat_id}\n'
+                        f'频率: {freq_key}\n'
+                        f'组合: {pair[0]}+{pair[1]}\n'
+                        f'时间: {t_text}\n'
+                        f'PMP: {y_val:.4f} m\n\n'
+                        '点击后按←/→键\n(图表窗口需有焦点)'
+                    ),
+                    bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.8)
+                )
+
+            cursor.connect('add', _on_overview_add)
+
+        axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+        fig.autofmt_xdate(rotation=0, ha='center')
+        fig.suptitle('Pseudorange Multipath Constellation', fontweight='bold', fontsize=plt.rcParams['figure.titlesize'])
+        fig.tight_layout(rect=[0, 0, 0.95, 0.96])
+
+        log_text = '\n'.join([
+            'Pseudorange Multipath Constellation Analysis Summary',
+            f'Smoothing window: {smoothing_window}',
+            f'Satellites plotted: {total_plotted}',
+            f'System filters: {system_filters if system_filters else "ALL"}',
+            f'Satellite filters: {sat_filters if sat_filters else "ALL"}',
+            f'Frequency filters: {freq_filters if freq_filters else "ALL"}',
+            'Selection rules:',
+            '  GPS/G -> L1C+L5Q',
+            '  BDS/C -> L1P+L5P -> L2I+L5P -> L2I+L1P',
+            '  Galileo/E -> L1C+L5Q -> L1C+L7Q -> L5Q+L7Q',
+            '  J -> L1C+L5Q',
+            '',
+            *log_lines,
+        ])
+
+        log_path = None
+        if save:
+            path = self._save_fig(fig, 'pseudorange_multipath_constellation', output_dir)
+            try:
+                reporter = ReportGenerator()
+                log_path = reporter.save_logs('pseudorange_multipath_constellation', log_text, self._ensure_output_dir(output_dir), prefix='pmp')
+            except Exception:
+                log_path = None
+            return {'figure': None, 'path': path, 'log_path': log_path, 'log_text': log_text}
+        return {'figure': fig, 'path': None, 'log_path': None, 'log_text': log_text}
+
     def plot_ionofree_cmc(self, ionofree_results: Dict[str, Any], sat_id: str = None,
                           save: bool = True, output_dir: Optional[str] = None) -> Dict[str, Any]:
         """绘制无电离层组合CMC时间序列图.
@@ -1274,4 +1683,677 @@ class GNSSPlotter:
             path = self._save_fig(fig, f'inter_freq_bias_{freq_pair[0]}_{freq_pair[1]}{suffix}', output_dir)
             return {'figure': None, 'path': path}
         return {'figure': fig, 'path': None}
+
+    def plot_cnr_analysis(self, observations: Dict[str, Any], save: bool = True,
+                         output_dir: Optional[str] = None,
+                         system_filters=None,
+                         sat_filters=None,
+                         freq_filters=None) -> Dict[str, Any]:
+        """Plot Carrier-to-Noise Ratio (CNR/C/N0) analysis with histogram and box plot.
+        
+        Grouped by satellite system and frequency (e.g., GPS-L1C, GPS-L5Q, GLO-L1C)
+        Left subplot: histogram of CNR values by frequency band
+        Right subplot: box plot of CNR distribution by frequency band
+        """
+        obs = observations.get('observations_meters', observations) if isinstance(observations, dict) else observations
+        if not obs:
+            raise ValueError('No observations available for CNR analysis')
+
+        import numpy as np
+        
+        # Extract CNR data grouped by system-frequency (not by individual satellite)
+        cnr_by_freq = {}  # (system, freq) -> [cnr_values]
+        freq_labels = []  # display labels like 'GPS-L1C', 'GPS-L5Q', etc.
+        freq_data = []    # corresponding CNR data arrays
+        
+        # Map system code to full name for display
+        system_names = {'G': 'GPS', 'R': 'GLO', 'E': 'Galileo', 'C': 'BDS', 'J': 'J-GPS', 'I': 'IRNSS'}
+        
+        for sat_id in sorted(obs.keys(), key=self._satellite_sort_key):
+            if not self._selection_allows(system_filters, sat_id[0]) or not self._selection_allows(sat_filters, sat_id):
+                continue
+            
+            system_code = sat_id[0]
+            system_name = system_names.get(system_code, system_code)
+            
+            sat_data = obs.get(sat_id, {})
+            for freq in sorted(sat_data.keys()):
+                if not self._frequency_sequence_accepts(sat_id, freq, system_filters, sat_filters, freq_filters):
+                    continue
+                
+                freq_values = sat_data.get(freq, {})
+                snr_list = freq_values.get('snr', []) or []
+                
+                # Filter out None values
+                valid_snr = [s for s in snr_list if s is not None and isinstance(s, (int, float))]
+                
+                if valid_snr:
+                    # Create key as (system_name, freq) for grouping across all satellites
+                    key = (system_name, freq)
+                    if key not in cnr_by_freq:
+                        cnr_by_freq[key] = []
+                    cnr_by_freq[key].extend(valid_snr)
+        
+        if not cnr_by_freq:
+            raise ValueError('No valid CNR data found')
+
+        # Prepare data for plotting - sort by system then frequency
+        system_order = {'GPS': 0, 'GLO': 1, 'Galileo': 2, 'BDS': 3, 'J-GPS': 4, 'IRNSS': 5}
+        sorted_keys = sorted(cnr_by_freq.keys(), key=lambda x: (system_order.get(x[0], 99), x[1]))
+        
+        for system_name, freq in sorted_keys:
+            label = f'{system_name[:3]} {freq}'
+            freq_labels.append(label)
+            freq_data.append(cnr_by_freq[(system_name, freq)])
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+        # Left: KDE curves showing C/N0 density by frequency band
+        colors = plt.cm.tab20(np.linspace(0, 1, len(freq_labels)))
+        all_min = min(min(data) for data in freq_data)
+        all_max = max(max(data) for data in freq_data)
+        span = all_max - all_min
+        pad = max(span * 0.1, 1.0)
+        x_grid = np.linspace(all_min - pad, all_max + pad, 512)
+
+        for i, (label, data) in enumerate(zip(freq_labels, freq_data)):
+            sample = np.asarray(data, dtype=float)
+            if sample.size < 2:
+                continue
+
+            sample_std = np.std(sample, ddof=1)
+            if not np.isfinite(sample_std) or sample_std == 0:
+                sample_std = 1.0
+            bandwidth = 1.06 * sample_std * (sample.size ** (-1 / 5))
+            bandwidth = max(bandwidth, 0.5)
+
+            diff = (x_grid[:, None] - sample[None, :]) / bandwidth
+            density = np.exp(-0.5 * diff ** 2).sum(axis=1)
+            density /= (sample.size * bandwidth * np.sqrt(2 * np.pi))
+
+            ax1.plot(x_grid, density, color=colors[i], linewidth=1.8, label=label)
+            ax1.fill_between(x_grid, density, color=colors[i], alpha=0.12)
+
+        ax1.set_xlabel('C/N0 (dB-Hz)', fontsize=plt.rcParams['axes.labelsize'])
+        ax1.set_ylabel('Probability Density', fontsize=plt.rcParams['axes.labelsize'])
+        ax1.set_title('C/N0 Distribution by Frequency Band', fontsize=plt.rcParams['font.size'])
+        ax1.grid(True, alpha=0.3, axis='y')
+        ax1.legend(loc='upper right', fontsize=10)
+
+        # Right: Box plot showing CNR statistics by frequency band
+        bp = ax2.boxplot(
+            freq_data,
+            labels=freq_labels,
+            patch_artist=True,
+            widths=0.6,
+            flierprops=dict(
+                marker='o',
+                markerfacecolor='none',
+                markeredgecolor='red',
+                markersize=5,
+                linestyle='none'
+            ),
+            medianprops=dict(color='green', linewidth=1.5)
+        )
+        
+        for patch in bp['boxes']:
+            patch.set_facecolor('none')
+            patch.set_alpha(1.0)
+        
+        ax2.set_ylabel('C/N0 (dB-Hz)', fontsize=plt.rcParams['axes.labelsize'])
+        ax2.set_title('C/N0 Statistics by Frequency Band', fontsize=plt.rcParams['font.size'])
+        ax2.grid(True, alpha=0.3, axis='y')
+        
+        # Rotate x-axis labels for readability
+        ax2.set_xticklabels(freq_labels, rotation=45, ha='right', fontsize=plt.rcParams['xtick.labelsize'])
+        
+        fig.tight_layout()
+
+        if MPLCURSORS_AVAILABLE and not save:
+            kde_cursor = mplcursors.cursor(ax1.lines, hover=False)
+
+            def _on_kde_click(sel):
+                x_val, y_val = sel.target
+                sel.annotation.set(
+                    text=f'C/N0: {x_val:.1f} dB-Hz\nDensity: {y_val:.4f}',
+                    bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.8)
+                )
+
+            kde_cursor.connect('add', _on_kde_click)
+
+            box_cursor = mplcursors.cursor(ax2, hover=True)
+            
+            def _on_boxplot_click(sel):
+                sel.annotation.set(
+                    text=f'C/N0: {sel.target[1]:.1f} dB-Hz',
+                    bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.8)
+                )
+            
+            box_cursor.connect('add', _on_boxplot_click)
+
+        if save:
+            path = self._save_fig(fig, 'cnr_analysis', output_dir)
+            return {'figure': None, 'path': path}
+        return {'figure': fig, 'path': None}
+
+    def plot_data_integrity(self, observations: Dict[str, Any], save: bool = True,
+                            output_dir: Optional[str] = None,
+                            system_filters=None,
+                            sat_filters=None,
+                            freq_filters=None) -> Dict[str, Any]:
+        """Compute and plot data integrity rate.
+
+        Left: bar chart of integrity rate per system-frequency (e.g., GPS L1C)
+        Right: bar chart of integrity rate per satellite (averaged across frequencies)
+        """
+        obs = observations.get('observations_meters', observations) if isinstance(observations, dict) else observations
+        if not obs:
+            raise ValueError('No observations available for data integrity analysis')
+
+        # collect per-satellite visible epochs (union of all timestamps per satellite)
+        import numpy as np
+        sat_visible_epochs = {}
+        for sat_id, freqs in obs.items():
+            if not self._selection_allows(system_filters, sat_id[0]) or not self._selection_allows(sat_filters, sat_id):
+                continue
+            sat_times = set()
+            for freq, data in freqs.items():
+                times = data.get('times', []) or []
+                for t in times:
+                    sat_times.add(t)
+            if sat_times:
+                sat_visible_epochs[sat_id] = len(sat_times)
+
+        if not sat_visible_epochs:
+            raise ValueError('No epoch times found')
+
+        # compute actual counts per sat-freq (require both code and phase present)
+        actual_counts = {}  # (sat_id, freq) -> count
+        for sat_id in sorted(obs.keys(), key=self._satellite_sort_key):
+            if not self._selection_allows(system_filters, sat_id[0]) or not self._selection_allows(sat_filters, sat_id):
+                continue
+            for freq, data in obs[sat_id].items():
+                if not self._frequency_sequence_accepts(sat_id, freq, system_filters, sat_filters, freq_filters):
+                    continue
+                codes = data.get('code', []) or []
+                phases = data.get('phase', []) or []
+                cnt = 0
+                for c, p in zip(codes, phases):
+                    if c is not None and p is not None:
+                        cnt += 1
+                actual_counts[(sat_id, freq)] = cnt
+
+        if not actual_counts:
+            raise ValueError('No valid data points for integrity calculation')
+
+        # group by system-frequency — only include sats that actually have data for this freq
+        system_names = {'G': 'GPS', 'R': 'GLO', 'E': 'Galileo', 'C': 'BDS', 'J': 'J-GPS', 'I': 'IRNSS'}
+        sf_groups = {}  # (system_name, freq) -> list of sat keys
+        sat_list = set()
+        for (sat_id, freq), cnt in actual_counts.items():
+            if cnt <= 0:
+                continue
+            system = system_names.get(sat_id[0], sat_id[0])
+            key = (system, freq)
+            sf_groups.setdefault(key, []).append((sat_id, cnt))
+            sat_list.add(sat_id)
+
+        # determine selected systems (map filters to single-letter codes if needed)
+        selected_system_codes = set()
+        if system_filters:
+            # accept list of single-letter codes or full names
+            reverse_map = {v: k for k, v in system_names.items()}
+            for item in system_filters:
+                if not item:
+                    continue
+                s = str(item)
+                if len(s) == 1:
+                    selected_system_codes.add(s)
+                else:
+                    # try match full name or first 3 letters
+                    uc = s.upper()
+                    if uc in reverse_map:
+                        selected_system_codes.add(reverse_map[uc])
+                    else:
+                        # try matching by prefix (GPS->G)
+                        for full, code in reverse_map.items():
+                            if full.upper().startswith(uc[:3]):
+                                selected_system_codes.add(code)
+                                break
+        else:
+            # no explicit filter -> infer from data
+            for sat_id in obs.keys():
+                if sat_id:
+                    selected_system_codes.add(sat_id[0])
+
+        # decide plotting mode
+        multi_system_mode = len(selected_system_codes) >= 2
+
+        # compute ratios per system-frequency
+        sf_labels = []
+        sf_ratios = []
+        for key in sorted(sf_groups.keys(), key=lambda x: (x[0], x[1])):
+            system_name = key[0]
+            # consider only selected systems
+            code = next((k for k, v in system_names.items() if v == system_name), system_name[:1])
+            if code not in selected_system_codes and not multi_system_mode:
+                # if single-system mode and this key not in selected, skip
+                continue
+            sats = sf_groups[key]
+            actual_total = sum(cnt for _, cnt in sats)
+            expected_total = sum(sat_visible_epochs.get(sat_id, 0) for sat_id, _ in sats)
+            ratio = actual_total / expected_total if expected_total > 0 else 0.0
+            sf_labels.append(f"{system_name[:3]} {key[1]}")
+            sf_ratios.append(ratio)
+
+        # compute per-satellite overall ratio — only freqs with cnt>0
+        sat_ratios = {}
+        for sat in sorted(sat_list, key=self._satellite_sort_key):
+            if sat and sat[0] not in selected_system_codes and not multi_system_mode:
+                continue
+            keys = [(s, f) for (s, f) in actual_counts.keys() if s == sat]
+            if not keys:
+                continue
+            # only include frequencies where the satellite actually has data
+            active_keys = [(s, f) for (s, f) in keys if actual_counts.get((s, f), 0) > 0]
+            if not active_keys:
+                continue
+            actual_total = sum(actual_counts[(sat, f)] for (_, f) in active_keys)
+            expected_total = sat_visible_epochs.get(sat, 0) * len(active_keys)
+            sat_ratios[sat] = (actual_total / expected_total) if expected_total > 0 else 0.0
+
+        # plotting: single-axis only
+        fig, ax = plt.subplots(1, 1, figsize=(16, 6))
+
+        # reuse CNR system order for consistent ordering
+        system_order = {'GPS': 0, 'GLO': 1, 'Galileo': 2, 'BDS': 3, 'J-GPS': 4, 'IRNSS': 5}
+
+        if multi_system_mode:
+            # prepare and filter out zero-data SF entries, sort by system_order then freq
+            items = []
+            for key in sf_groups.keys():
+                system_name, freq = key
+                sats = sf_groups[key]
+                actual_total = sum(cnt for _, cnt in sats)
+                if actual_total <= 0:
+                    continue
+                expected_total = sum(sat_visible_epochs.get(sat_id, 0) for sat_id, _ in sats)
+                ratio = actual_total / expected_total if expected_total > 0 else 0.0
+                items.append((system_name, freq, ratio))
+
+            items_sorted = sorted(items, key=lambda x: (system_order.get(x[0], 99), x[1]))
+            labels = [f"{it[0][:3]} {it[1]}" for it in items_sorted]
+            ratios = [it[2] for it in items_sorted]
+
+            x = np.arange(len(labels))
+            bars = ax.bar(x, np.array(ratios) * 100.0, width=0.5, color=plt.cm.viridis(np.linspace(0, 1, len(labels))))
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=plt.rcParams['xtick.labelsize'])
+            ax.set_ylabel('Data Integrity Rate (%)')
+            ax.set_title('Data Integrity by Frequency Band')
+            ax.grid(True, axis='y', alpha=0.3)
+
+            for bar, val in zip(bars, ratios):
+                h = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width() / 2, h + 1, f"{val*100:.1f}", ha='center', va='bottom', fontsize=plt.rcParams.get('font.size', 10))
+
+        else:
+            # Single system selected: grouped bar chart per-satellite with frequencies colored
+            single_code = next(iter(selected_system_codes)) if selected_system_codes else None
+            sat_freqs = {}
+            freq_counts = {}
+            for (sat_id, freq), cnt in actual_counts.items():
+                if single_code and sat_id[0] != single_code:
+                    continue
+                sat_freqs.setdefault(sat_id, {})[freq] = cnt
+                freq_counts[freq] = freq_counts.get(freq, 0) + cnt
+
+            # remove frequencies with zero total across sats
+            freq_set = sorted([f for f, c in freq_counts.items() if c > 0])
+            sats = sorted(sat_freqs.keys(), key=self._satellite_sort_key)
+
+            if not sats:
+                ax.text(0.5, 0.5, 'No data for selected system', ha='center')
+            else:
+                n_freq = len(freq_set)
+                x = np.arange(len(sats))
+                total_width = 0.8
+                bar_width = total_width / max(n_freq, 1)
+                colors = plt.cm.tab10(np.linspace(0, 1, n_freq))
+                for i, freq in enumerate(freq_set):
+                    vals = []
+                    for sat in sats:
+                        cnt = sat_freqs.get(sat, {}).get(freq, 0)
+                        sat_expected = sat_visible_epochs.get(sat, 0)
+                        vals.append((cnt / sat_expected) * 100.0 if sat_expected > 0 else 0.0)
+                    offsets = x - total_width/2 + i*bar_width + bar_width/2
+                    bars = ax.bar(offsets, vals, width=bar_width*0.9, color=colors[i], label=freq)
+                    for bar, sat, v in zip(bars, sats, vals):
+                        bar._sat = sat
+                        bar._freq = freq
+                        cnt_val = sat_freqs.get(sat, {}).get(freq, 0)
+                        bar._cnt = cnt_val
+                        bar._visible = sat_visible_epochs.get(sat, 0)
+
+                ax.set_xticks(x)
+                ax.set_xticklabels(sats, rotation=45, ha='right')
+                ax.set_ylabel('Data Integrity Rate (%)')
+                ax.set_title(f'Data Integrity per Satellite ({single_code})')
+                ax.legend(title='Frequency', fontsize=8)
+                ax.grid(True, axis='y', alpha=0.3)
+
+        fig.tight_layout()
+
+        # interactive tooltip for single-system mode
+        if MPLCURSORS_AVAILABLE and not save and not multi_system_mode:
+            cursor = mplcursors.cursor(ax.patches, hover=False)
+
+            def _on_di_add(sel):
+                patch = sel.artist
+                sat = getattr(patch, '_sat', '?')
+                freq = getattr(patch, '_freq', '?')
+                cnt = getattr(patch, '_cnt', None)
+                visible = getattr(patch, '_visible', 0)
+                rate_val = patch.get_height()
+                if cnt is not None:
+                    sel.annotation.set(
+                        text=f'{sat} {freq}\nRate: {rate_val:.1f}%\nActual: {cnt}/{visible}',
+                        bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.8)
+                    )
+                else:
+                    sel.annotation.set(
+                        text=f'{sat} {freq}\nRate: {rate_val:.1f}%',
+                        bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.8)
+                    )
+
+            cursor.connect('add', _on_di_add)
+
+        if save:
+            path = self._save_fig(fig, 'data_integrity', output_dir)
+            # write a simple text log summarizing the statistics
+            out_dir = self._ensure_output_dir(output_dir)
+            log_path = os.path.join(out_dir, 'data_integrity_log.txt')
+            with open(log_path, 'w', encoding='utf-8') as fh:
+                fh.write(f'Data Integrity Report\n')
+                fh.write(f'Generated: {datetime.datetime.utcnow().isoformat()}Z\n')
+                fh.write('Per-satellite visible epoch counts:\n')
+                fh.write(f'{"Satellite":<12}{"VisibleEpochs":>14}\n')
+                for sat in sorted(sat_visible_epochs.keys(), key=self._satellite_sort_key):
+                    fh.write(f'{sat:<12}{sat_visible_epochs[sat]:>14}\n')
+                fh.write('\nSystem-Frequency Statistics:\n')
+                fh.write(f'{"System-Freq":<12}{"ActualEpochs":>14}{"ExpectedEpochs":>16}{"IntegrityRate(%)":>18}\n')
+                for key in sorted(sf_groups.keys(), key=lambda x: (system_order.get(x[0], 99), x[1])):
+                    system_name, freq = key
+                    sats = sf_groups[key]
+                    actual_total = sum(cnt for _, cnt in sats)
+                    expected_total = sum(sat_visible_epochs.get(sat_id, 0) for sat_id, _ in sats)
+                    if expected_total > 0:
+                        ratio = actual_total / expected_total
+                    else:
+                        ratio = 0.0
+                    fh.write(f'{system_name[:3] + " " + freq:<12}{actual_total:>14}{expected_total:>16}{ratio*100:>18.2f}\n')
+                fh.write('\nPer-Satellite Statistics:\n')
+                fh.write(f'{"Satellite":<12}{"VisibleEpochs":>14}{"ActiveFreqs":>12}{"ActualEpochs":>14}{"IntegrityRate(%)":>18}\n')
+                for sat in sorted(sat_ratios.keys(), key=self._satellite_sort_key):
+                    freq_keys = [(s, f) for (s, f) in actual_counts.keys() if s == sat]
+                    active_keys = [(s, f) for (s, f) in freq_keys if actual_counts.get((s, f), 0) > 0]
+                    actual_total = sum(actual_counts[(sat, f)] for (_, f) in active_keys)
+                    visible = sat_visible_epochs.get(sat, 0)
+                    active_count = len(active_keys)
+                    expected_total = visible * active_count
+                    rate = actual_total / expected_total if expected_total > 0 else 0.0
+                    fh.write(f'{sat:<12}{visible:>14}{active_count:>12}{actual_total:>14}{rate*100:>18.2f}\n')
+                fh.write('\nNote: IntegrityRate = ActualEpochs / ExpectedEpochs, where ExpectedEpochs = SatelliteVisibleEpochs * ActiveFreqs\n')
+                fh.write('Only frequencies with at least one valid code+phase observation are counted (ActiveFreqs).\n')
+            return {'figure': None, 'path': path, 'log': log_path}
+        return {'figure': fig, 'path': None}
+
+    def plot_observation_noise(self, observations: Dict[str, Any], save: bool = True,
+                                output_dir: Optional[str] = None,
+                                system_filters=None,
+                                sat_filters=None,
+                                freq_filters=None) -> Dict[str, Any]:
+        """Plot pseudorange and carrier phase observation noise (third-order difference).
+
+        Dual-mode layout (matching data_integrity):
+          - >=2 systems: left=code noise bars, right=phase noise bars (system-freq x-axis)
+          -  1 system:   grouped bars by satellite with colored frequencies
+
+        Displays σ (sigma, STD/sqrt(20)) and RMS at bar tops and in title annotations.
+        """
+        from src.processing.calculator import MetricCalculator
+
+        obs = observations.get('observations_meters', observations) if isinstance(observations, dict) else observations
+        if not obs:
+            raise ValueError('No observations available for noise analysis')
+
+        # === pre-filter observations to respect all three filter types ===
+        filtered_obs = {}
+        for sat_id in sorted(obs.keys(), key=self._satellite_sort_key):
+            if not self._selection_allows(system_filters, sat_id[0]) or not self._selection_allows(sat_filters, sat_id):
+                continue
+            filtered_freqs = {}
+            for freq, data in obs[sat_id].items():
+                if not self._frequency_sequence_accepts(sat_id, freq, system_filters, sat_filters, freq_filters):
+                    continue
+                filtered_freqs[freq] = data
+            if filtered_freqs:
+                filtered_obs[sat_id] = filtered_freqs
+
+        if not filtered_obs:
+            raise ValueError('No observations after filtering')
+
+        # compute results using only filtered data
+        mc = MetricCalculator()
+        noise_results = mc.calculate_observation_noise({'observations_meters': filtered_obs})
+        summary = noise_results.pop('summary', {})
+
+        if not noise_results:
+            raise ValueError('No valid noise data computed')
+
+        import numpy as np
+        system_names = {'G': 'GPS', 'R': 'GLO', 'E': 'Galileo', 'C': 'BDS', 'J': 'J-GPS', 'I': 'IRNSS'}
+        system_order = {'GPS': 0, 'GLO': 1, 'Galileo': 2, 'BDS': 3, 'J-GPS': 4, 'IRNSS': 5}
+
+        # === determine selected systems ===
+        selected_system_codes = set()
+        if system_filters:
+            reverse_map = {v: k for k, v in system_names.items()}
+            for item in system_filters:
+                s = str(item)
+                if len(s) == 1:
+                    selected_system_codes.add(s)
+                else:
+                    uc = s.upper()
+                    if uc in reverse_map:
+                        selected_system_codes.add(reverse_map[uc])
+                    else:
+                        for full, code in reverse_map.items():
+                            if full.upper().startswith(uc[:3]):
+                                selected_system_codes.add(code)
+                                break
+        else:
+            for sat_id in obs.keys():
+                if sat_id:
+                    selected_system_codes.add(sat_id[0])
+        multi_system_mode = len(selected_system_codes) >= 2
+
+        # === build summary items with filtering ===
+        summary_items = []  # (system, freq, sigma_p, sigma_l, rms_p, rms_l, n_sats)
+        for (system, freq), stats in summary.items():
+            code = next((k for k, v in system_names.items() if v == system), system[:1])
+            if code not in selected_system_codes and not multi_system_mode:
+                continue
+            summary_items.append((system, freq, stats['sigma_p'], stats['sigma_l'],
+                                  stats.get('rms_p', stats['sigma_p'] * math.sqrt(20)),
+                                  stats.get('rms_l', stats['sigma_l'] * math.sqrt(20)),
+                                  stats['n_sats']))
+
+        if not summary_items:
+            raise ValueError('No noise summary data after filtering')
+
+        system_order_map = {s: system_order.get(s, 99) for s in set(it[0] for it in summary_items)}
+
+        # === plotting ===
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6))
+
+        if multi_system_mode:
+            # sort by system_order then freq
+            items_sorted = sorted(summary_items, key=lambda x: (system_order.get(x[0], 99), x[1]))
+            labels = [f"{it[0][:3]} {it[1]}" for it in items_sorted]
+            sigma_p_vals = [it[2] for it in items_sorted]
+            sigma_l_vals = [it[3] for it in items_sorted]
+            # use sigma_p / sigma_l from summary as unified estimate
+            code_vals = [it[2] for it in items_sorted]
+            phase_vals = [it[3] for it in items_sorted]
+
+            x = np.arange(len(labels))
+            width = 0.5
+            rms_p_vals = [it[4] for it in items_sorted]
+            rms_l_vals = [it[5] for it in items_sorted]
+
+            bars_p = ax1.bar(x, sigma_p_vals, width=width, color='tomato', alpha=0.8)
+            ax1.set_xticks(x)
+            ax1.set_xticklabels(labels, rotation=45, ha='right', fontsize=plt.rcParams['xtick.labelsize'])
+            ax1.set_ylabel('Code Noise σ (m)')
+            ax1.set_title('Pseudorange Noise by Frequency Band')
+            ax1.grid(True, axis='y', alpha=0.3)
+            for bar, val in zip(bars_p, sigma_p_vals):
+                h = bar.get_height()
+                ax1.text(bar.get_x() + bar.get_width() / 2, h * 1.008,
+                        f"{val:.3f}",
+                        ha='center', va='bottom', fontsize=plt.rcParams.get('font.size', 8))
+
+            bars_l = ax2.bar(x, sigma_l_vals, width=width, color='steelblue', alpha=0.8)
+            ax2.set_xticks(x)
+            ax2.set_xticklabels(labels, rotation=45, ha='right', fontsize=plt.rcParams['xtick.labelsize'])
+            ax2.set_ylabel('Phase Noise σ (m)')
+            ax2.set_title('Carrier Phase Noise by Frequency Band')
+            ax2.grid(True, axis='y', alpha=0.3)
+            for bar, val in zip(bars_l, sigma_l_vals):
+                h = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width() / 2, h * 1.008,
+                        f"{val:.4f}",
+                        ha='center', va='bottom', fontsize=plt.rcParams.get('font.size', 8))
+
+        else:
+            # Single system — grouped bars per satellite with colored frequencies
+            single_code = next(iter(selected_system_codes)) if selected_system_codes else None
+            system_name = system_names.get(single_code, single_code)
+
+            # collect per-sat-per-freq noise values
+            sat_freqs = {}  # sat -> {freq: {sigma_p, sigma_l, ...}}
+            freq_set = []
+            for sat_id, freq_map in noise_results.items():
+                if single_code and sat_id[0] != single_code:
+                    continue
+                sat_freqs[sat_id] = {}
+                for freq, stats in freq_map.items():
+                    sat_freqs[sat_id][freq] = stats
+                    if freq not in freq_set:
+                        freq_set.append(freq)
+
+            freq_set = sorted(freq_set)
+            sats = sorted(sat_freqs.keys(), key=self._satellite_sort_key)
+
+            if not sats:
+                ax1.text(0.5, 0.5, 'No data for selected system', ha='center', transform=ax1.transAxes)
+                ax2.text(0.5, 0.5, 'No data for selected system', ha='center', transform=ax2.transAxes)
+            else:
+                n_freq = len(freq_set)
+                x = np.arange(len(sats))
+                total_width = 0.8
+                bar_width = total_width / max(n_freq, 1)
+                colors = plt.cm.tab10(np.linspace(0, 1, n_freq))
+
+                for i, freq in enumerate(freq_set):
+                    vals_p = []
+                    vals_l = []
+                    for sat in sats:
+                        info = sat_freqs.get(sat, {}).get(freq, None)
+                        vals_p.append(info['sigma_p'] if info else 0.0)
+                        vals_l.append(info['sigma_l'] if info else 0.0)
+                    offsets = x - total_width / 2 + i * bar_width + bar_width / 2
+
+                    ax1.bar(offsets, vals_p, width=bar_width * 0.9, color=colors[i], label=freq)
+                    ax2.bar(offsets, vals_l, width=bar_width * 0.9, color=colors[i], label=freq)
+
+                # attach metadata to each bar for interactivity
+                n_sats = len(sats)
+                for bar_idx in range(min(len(ax1.patches), len(ax2.patches))):
+                    fi = bar_idx // n_sats  # frequency index
+                    si = bar_idx % n_sats   # satellite index
+                    if si < n_sats and fi < len(freq_set):
+                        sat = sats[si]
+                        freq_name = freq_set[fi]
+                        info = sat_freqs.get(sat, {}).get(freq_name, None)
+                        if info:
+                            ax1.patches[bar_idx]._sat = sat
+                            ax1.patches[bar_idx]._freq = freq_name
+                            ax1.patches[bar_idx]._info = info
+                            ax2.patches[bar_idx]._sat = sat
+                            ax2.patches[bar_idx]._freq = freq_name
+                            ax2.patches[bar_idx]._info = info
+
+                ax1.set_xticks(x)
+                ax1.set_xticklabels(sats, rotation=45, ha='right')
+                ax1.set_ylabel('Code Noise σ (m)')
+                ax1.set_title(f'Pseudorange Noise ({single_code})')
+                ax1.legend(title='Freq', fontsize=8)
+                ax1.grid(True, axis='y', alpha=0.3)
+
+                ax2.set_xticks(x)
+                ax2.set_xticklabels(sats, rotation=45, ha='right')
+                ax2.set_ylabel('Phase Noise σ (m)')
+                ax2.set_title(f'Carrier Phase Noise ({single_code})')
+                ax2.legend(title='Freq', fontsize=8)
+                ax2.grid(True, axis='y', alpha=0.3)
+
+        fig.tight_layout()
+
+        # interactive tooltip for single-system mode (too many bars for static text)
+        if MPLCURSORS_AVAILABLE and not save and not multi_system_mode:
+            for ax, key, label in [(ax1, 'sigma_p', 'Code σ'), (ax2, 'sigma_l', 'Phase σ')]:
+                cursor = mplcursors.cursor(ax.patches, hover=False)
+
+                def _make_on_add(k, lbl):
+                    def _on_add(sel):
+                        patch = sel.artist
+                        sat = getattr(patch, '_sat', '?')
+                        freq = getattr(patch, '_freq', '?')
+                        info = getattr(patch, '_info', None)
+                        if info:
+                            val = info.get(k, 0)
+                            sel.annotation.set(
+                                text=f'{sat} {freq}\n{lbl}: {val:.6f} m',
+                                bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.8)
+                            )
+                        else:
+                            sel.annotation.set(
+                                text=f'{sat} {freq}\n{lbl}: {patch.get_height():.4f} m',
+                                bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.8)
+                            )
+                    return _on_add
+
+                cursor.connect('add', _make_on_add(key, label))
+
+        # === log ===
+        log_path = None
+        if save:
+            path = self._save_fig(fig, 'observation_noise', output_dir)
+            out_dir = self._ensure_output_dir(output_dir)
+            log_path = os.path.join(out_dir, 'observation_noise_log.txt')
+            with open(log_path, 'w', encoding='utf-8') as fh:
+                fh.write('Observation Noise Report (Third-Order Difference Method)\n')
+                fh.write(f'Generated: {datetime.datetime.utcnow().isoformat()}Z\n\n')
+                fh.write('System-Frequency Summary (σ = RMS(Δ)/√20):\n')
+                fh.write(f'{"System-Freq":<14}{"Sats":>6}{"Code σ (m)":>14}{"Phase σ (m)":>16}\n')
+                items_sorted = sorted(summary_items, key=lambda x: (system_order.get(x[0], 99), x[1]))
+                for system, freq, sp, sl, rp, rl, ns in items_sorted:
+                    fh.write(f'{system[:3] + " " + freq:<14}{ns:>6}{sp:>14.4f}{sl:>16.6f}\n')
+                fh.write('\nNote: σ = RMS(Δ)/√20, where Δ is the third-order difference\n')
+            return {'figure': None, 'path': path, 'log': log_path}
+        return {'figure': fig, 'path': None, 'log': None}
+
 
