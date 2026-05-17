@@ -159,24 +159,28 @@ class VisualizationWindow:
         chart_frame = ttk.LabelFrame(main_frame, text='图表类型', padding=10)
         chart_frame.pack(fill=tk.X, pady=8)
         chart_types = [
+            # 基础数据概览
             ('原始观测', 'raw_observations'),
             ('卫星-频点序列', 'sat_freq_sequence'),
             ('卫星数量', 'satellite_count'),
+            ('载噪比分析', 'cnr_analysis'),
+            ('数据完整率', 'data_integrity'),
+            # 观测数据质量
+            ('观测噪声分析', 'observation_noise'),
             ('伪距多路径-星座', 'pseudorange_multipath_overview'),
             ('伪距多路径-卫星', 'pseudorange_multipath'),
-            ('观测值一阶差分', 'derivatives'),
-            ('伪距相位差值之差', 'code_phase_diffs'),
+            # 码-相位一致性
             ('伪距相位原始差值', 'code_phase_diff_raw'),
+            ('伪距相位差值之差', 'code_phase_diffs'),
+            ('观测值一阶差分', 'derivatives'),
             ('相位预测误差', 'phase_pred_errors'),
+            # 精密分析
             ('历元间双差', 'double_differences'),
-            ('ISB分析', 'isb_analysis'),
+            ('周跳探测分析 (MW & GF & LLI)', 'cycle_slip_detection'),
             ('接收机CMC', 'receiver_cmc'),
             ('无电离层组合CMC', 'ionofree_cmc'),
-            ('周跳探测分析 (MW & GF & LLI)', 'cycle_slip_detection'),
+            ('ISB分析', 'isb_analysis'),
             ('伪距频间偏差与ISD验证', 'inter_freq_bias'),
-            ('载噪比分析', 'cnr_analysis')
-            ,('数据完整率','data_integrity')
-            ,('观测噪声分析','observation_noise')
         ]
         chart_var = tk.StringVar(value='raw_observations')
         
