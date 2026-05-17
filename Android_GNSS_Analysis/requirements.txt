@@ -1,7 +1,8 @@
 numpy>=1.22.0
 matplotlib
-# pandas is listed, but not used in codebase. Commented out for now.
-# pandas
+pandas
+scipy
+mplcursors
 
 # GUI: tkinter is used, but is part of the Python standard library (no pip install needed)
 # If you use pandas in the future, uncomment the line above.
