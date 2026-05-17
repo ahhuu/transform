@@ -1,20 +1,41 @@
+# --- IDE ---
 .venv/
 .vscode/
 .idea/
 .history/
+
+# --- 构建产物 ---
 build_dist/
+*.egg-info/
+dist/
+
+# --- 观测数据 ---
 data/
+# 保留源码中的数据层代码
 !Android_GNSS_Analysis/src/data/
 !Android_GNSS_Analysis/src/data/**
+
+# --- 项目文档 ---
 docs/
+
+# --- 日志 ---
 logs/
-resources/
-results/
+gnss_converter.log
+tools/conversion_tools/gnss_converter.log
+Android_GNSS_Analysis/tools/conversion_tools/gnss_converter.log
+
+# --- Python ---
 *.pyc
 __pycache__/
-tools/conversion_tools/gnss_converter.log
+
+# --- 临时文件 ---
 tools/conversion_tools/main.cpp
 tools/conversion_tools/RINEX改进.md
 tools/conversion_tools/RinexLogger.java
-gnss_converter.log
-Android_GNSS_Analysis/tools/conversion_tools/gnss_converter.log
+
+# --- 运行结果 ---
+results/
+
+# --- 操作系统文件 ---
+.DS_Store
+Thumbs.db
