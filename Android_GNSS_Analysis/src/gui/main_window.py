@@ -3,6 +3,25 @@ from .process_gui import PreprocessingWindow
 from .visual_gui import VisualizationWindow
 from .report_gui import ReportWindow
 from .tools_launcher import ToolLauncher
+from .usage_tracker import UsageTracker
+
+# ============================================================
+# 所有工具的注册信息: (显示名称, 路径元组, 所属菜单类别)
+# ============================================================
+TOOLS_REGISTRY = [
+    # 分析工具
+    ("API 不确定度分析",       ("analysis_tools", "Api_Analysis_Tool.py"),               "analysis"),
+    ("SNR 权重建模",           ("analysis_tools", "SNR_Weighting.py"),                   "analysis"),
+    ("误差曲线分析",           ("analysis_tools", "Error_Curve_Analysis.py"),            "analysis"),
+    # 格式转换工具
+    ("Android 原始数据转RINEX", ("conversion_tools", "Mod-Androidgnsslog_to_rinex.py"),  "conversion"),
+    ("随机模型表达式转换",     ("conversion_tools", "ModelConverter.py"),                "conversion"),
+    ("GNSS 时间日期转换",      ("conversion_tools", "Time_Date_Converter.py"),           "conversion"),
+    # 坐标工具
+    ("批量 XYZ 写入 Coords",   ("coordinate_tools", "batch_xyz_to_coords.py"),           "coordinate"),
+    ("静态坐标转换",           ("coordinate_tools", "Static_Coordinate_Transformation.py"), "coordinate"),
+    ("动态坐标转换",           ("coordinate_tools", "Dynamic_Coordinate_Transformation.py"), "coordinate"),
+]
 
 
 def main():
@@ -24,6 +43,7 @@ def main():
 
     ctx = AnalysisContext()
     launcher = ToolLauncher()
+    tracker = UsageTracker()
 
     # Create windows with context
     pp = PreprocessingWindow(ctx)
@@ -49,52 +69,39 @@ def main():
     menubar.add_cascade(label="报告", menu=report_menu)
     report_menu.add_command(label="生成分析报告", command=lambda: rr.show(root))
 
-    def _launch_tool(rel_parts):
+    def _launch_tool(label, rel_parts):
+        """启动外部工具并记录使用次数"""
+        tracker.record_usage(label)
         script = launcher.script_path(*rel_parts)
         ok, msg = launcher.launch(script)
         if not ok:
             messagebox.showerror("工具启动失败", msg)
+        else:
+            _refresh_quick_tools()
 
     # 工具菜单
     tools_menu = tk.Menu(menubar, tearoff=0)
     menubar.add_cascade(label="工具", menu=tools_menu)
 
+    # 按类别构建菜单
     analysis_menu = tk.Menu(tools_menu, tearoff=0)
     tools_menu.add_cascade(label="分析工具", menu=analysis_menu)
-    analysis_menu.add_command(
-        label="API 不确定度分析",
-        command=lambda: _launch_tool(("analysis_tools", "Api_Analysis_Tool.py")),
-    )
-    analysis_menu.add_command(
-        label="SNR 权重建模",
-        command=lambda: _launch_tool(("analysis_tools", "SNR_Weighting.py")),
-    )
-
     conversion_menu = tk.Menu(tools_menu, tearoff=0)
     tools_menu.add_cascade(label="格式转换工具", menu=conversion_menu)
-    conversion_menu.add_command(
-        label="Android 原始数据转RINEX",
-        command=lambda: _launch_tool(("conversion_tools", "Mod-Androidgnsslog_to_rinex.py")),
-    )
-    conversion_menu.add_command(
-        label="随机模型表达式转换",
-        command=lambda: _launch_tool(("conversion_tools", "ModelConverter.py")),
-    )
-
     coord_menu = tk.Menu(tools_menu, tearoff=0)
     tools_menu.add_cascade(label="坐标工具", menu=coord_menu)
-    coord_menu.add_command(
-        label="批量 XYZ 写入 Coords",
-        command=lambda: _launch_tool(("coordinate_tools", "batch_xyz_to_coords.py")),
-    )
-    coord_menu.add_command(
-        label="静态坐标转换",
-        command=lambda: _launch_tool(("coordinate_tools", "Static_Coordinate_Transformation.py")),
-    )
-    coord_menu.add_command(
-        label="动态坐标转换",
-        command=lambda: _launch_tool(("coordinate_tools", "Dynamic_Coordinate_Transformation.py")),
-    )
+
+    # 用 TOOLS_REGISTRY 填充各子菜单
+    for label, path_parts, category in TOOLS_REGISTRY:
+        target_menu = {
+            "analysis": analysis_menu,
+            "conversion": conversion_menu,
+            "coordinate": coord_menu,
+        }[category]
+        target_menu.add_command(
+            label=label,
+            command=lambda lbl=label, pp=path_parts: _launch_tool(lbl, pp),
+        )
 
     # 主界面
     main_frame = ttk.Frame(root, padding="20")
@@ -130,49 +137,45 @@ def main():
     ttk.Button(quick_btn_frame, text="生成报告",
                command=lambda: rr.show(root)).pack(side=tk.LEFT, padx=10)
 
+    # ---------- 动态常用工具 (显示使用次数最多的前4个) ----------
     tools_quick_frame = ttk.LabelFrame(quick_frame, text="常用工具", padding="10")
     tools_quick_frame.pack(fill=tk.X, pady=(15, 0))
 
-    row1 = ttk.Frame(tools_quick_frame)
-    row1.pack(pady=4)
-    ttk.Button(
-        row1,
-        text="API 不确定度分析",
-        command=lambda: _launch_tool(("analysis_tools", "Api_Analysis_Tool.py")),
-    ).pack(side=tk.LEFT, padx=6)
-    ttk.Button(
-        row1,
-        text="SNR 权重建模",
-        command=lambda: _launch_tool(("analysis_tools", "SNR_Weighting.py")),
-    ).pack(side=tk.LEFT, padx=6)
-    ttk.Button(
-        row1,
-        text="Android 原始数据转RINEX",
-        command=lambda: _launch_tool(("conversion_tools", "Mod-Androidgnsslog_to_rinex.py")),
-    ).pack(side=tk.LEFT, padx=6)
+    # label -> path_parts 的快速查找表
+    _tools_map = {lbl: pp for lbl, pp, _cat in TOOLS_REGISTRY}
 
-    row2 = ttk.Frame(tools_quick_frame)
-    row2.pack(pady=4)
-    ttk.Button(
-        row2,
-        text="模型表达式转换",
-        command=lambda: _launch_tool(("conversion_tools", "ModelConverter.py")),
-    ).pack(side=tk.LEFT, padx=6)
-    ttk.Button(
-        row2,
-        text="批量 XYZ 写入 Coords",
-        command=lambda: _launch_tool(("coordinate_tools", "batch_xyz_to_coords.py")),
-    ).pack(side=tk.LEFT, padx=6)
-    ttk.Button(
-        row2,
-        text="静态坐标转换",
-        command=lambda: _launch_tool(("coordinate_tools", "Static_Coordinate_Transformation.py")),
-    ).pack(side=tk.LEFT, padx=6)
-    ttk.Button(
-        row2,
-        text="动态坐标转换",
-        command=lambda: _launch_tool(("coordinate_tools", "Dynamic_Coordinate_Transformation.py")),
-    ).pack(side=tk.LEFT, padx=6)
+    def _refresh_quick_tools():
+        """刷新常用工具按钮区域"""
+        # 清除旧按钮
+        for w in tools_quick_frame.winfo_children():
+            w.destroy()
+
+        top_tools = tracker.get_top(4)
+        if not top_tools:
+            # 还没有使用记录 → 显示默认的前4个工具
+            top_tools = [(TOOLS_REGISTRY[i][0], 0) for i in range(min(4, len(TOOLS_REGISTRY)))]
+
+        # 按每行2个排列
+        for i in range(0, len(top_tools), 2):
+            row = ttk.Frame(tools_quick_frame)
+            row.pack(pady=4)
+            for j in range(2):
+                if i + j < len(top_tools):
+                    label_name, count = top_tools[i + j]
+                    path = _tools_map.get(label_name)
+                    if path is None:
+                        continue
+                    # 显示名称 + 使用次数角标
+                    btn_text = f"{label_name}  [{count}]"
+                    btn = ttk.Button(
+                        row,
+                        text=btn_text,
+                        command=lambda lbl=label_name, pp=path: _launch_tool(lbl, pp),
+                    )
+                    btn.pack(side=tk.LEFT, padx=6)
+
+    # 首次刷新
+    _refresh_quick_tools()
 
     # 版权信息
     copyright_frame = ttk.Frame(main_frame)
